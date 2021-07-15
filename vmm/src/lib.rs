@@ -284,6 +284,13 @@ pub fn start_vmm_thread(
     Ok(thread)
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+struct VmMigrationConfig {
+    vm_config: Arc<Mutex<VmConfig>>,
+    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    common_cpuid: hypervisor::CpuId,
+}
+
 pub struct Vmm {
     epoll: EpollContext,
     exit_evt: EventFd,
@@ -743,8 +750,39 @@ impl Vmm {
         socket
             .read_exact(&mut data)
             .map_err(MigratableError::MigrateSocket)?;
-        let config: VmConfig = serde_json::from_slice(&data).map_err(|e| {
-            MigratableError::MigrateReceive(anyhow!("Error deserialising config: {}", e))
+
+        let vm_migration_config: VmMigrationConfig =
+            serde_json::from_slice(&data).map_err(|e| {
+                MigratableError::MigrateReceive(anyhow!("Error deserialising config: {}", e))
+            })?;
+
+        // Todo: handle the error better
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        // We check the `CPUID` compatibility of between the source vm and destination, which is
+        // mostly about feature compatibility and "topology/sgx" leaves are not relevant.
+        let dest_cpuid = {
+            let config = &vm_migration_config.vm_config.lock().unwrap();
+            let phys_bits = vm::physical_bits(config.cpus.max_phys_bits);
+            arch::generate_common_cpuid(
+                self.hypervisor.clone(),
+                None,
+                None,
+                phys_bits,
+                config.cpus.kvm_hyperv,
+                #[cfg(feature = "tdx")]
+                config.tdx.is_some(),
+            )
+            .map_err(|_| {
+                MigratableError::MigrateReceive(anyhow!("Error 'generate_common_cpuid'"))
+            })?
+        };
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        arch::CpuidFeatureEntry::check_cpuid_compatibility(
+            &vm_migration_config.common_cpuid,
+            &dest_cpuid,
+        )
+        .map_err(|_| {
+            MigratableError::MigrateReceive(anyhow!("Error 'check_cpuid_compatibility'"))
         })?;
 
         let exit_evt = self.exit_evt.try_clone().map_err(|e| {
@@ -757,7 +795,7 @@ impl Vmm {
             MigratableError::MigrateReceive(anyhow!("Error cloning activate EventFd: {}", e))
         })?;
 
-        self.vm_config = Some(Arc::new(Mutex::new(config)));
+        self.vm_config = Some(vm_migration_config.vm_config);
         let vm = Vm::new_from_migration(
             self.vm_config.clone().unwrap(),
             exit_evt,
@@ -998,7 +1036,13 @@ impl Vmm {
             }
 
             // Send config
-            let config_data = serde_json::to_vec(&vm.get_config()).unwrap();
+            let vm_migration_config = VmMigrationConfig {
+                vm_config: vm.get_config(),
+                #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+                common_cpuid: vm.common_cpuid(),
+            };
+
+            let config_data = serde_json::to_vec(&vm_migration_config).unwrap();
             Request::config(config_data.len() as u64).write_to(&mut socket)?;
             socket
                 .write_all(&config_data)

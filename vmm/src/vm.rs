@@ -1941,6 +1941,11 @@ impl Vm {
             .map(|state| *state)
     }
 
+    #[cfg(target_arch = "x86_64")]
+    pub fn common_cpuid(&self) -> hypervisor::CpuId {
+        self.cpu_manager.lock().unwrap().common_cpuid()
+    }
+
     /// Load saved clock from snapshot
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     pub fn load_clock_from_snapshot(
