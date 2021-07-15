@@ -15,7 +15,7 @@ pub mod regs;
 use crate::GuestMemoryMmap;
 use crate::InitramfsConfig;
 use crate::RegionType;
-use hypervisor::{CpuId, CpuIdEntry, CPUID_FLAG_VALID_INDEX};
+use hypervisor::{CpuId, CpuIdEntry, HypervisorError, CPUID_FLAG_VALID_INDEX};
 use linux_loader::loader::bootparam::boot_params;
 use linux_loader::loader::elf::start_info::{
     hvm_memmap_table_entry, hvm_modlist_entry, hvm_start_info,
@@ -30,6 +30,26 @@ mod smbios;
 use std::arch::x86_64;
 #[cfg(feature = "tdx")]
 pub mod tdx;
+
+// CPUID feature bits
+const TSC_DEADLINE_TIMER_ECX_BIT: u8 = 24; // tsc deadline timer ecx bit.
+const HYPERVISOR_ECX_BIT: u8 = 31; // Hypervisor ecx bit.
+const MTRR_EDX_BIT: u8 = 12; // Hypervisor ecx bit.
+
+// KVM feature bits
+const KVM_FEATURE_ASYNC_PF_INT_BIT: u8 = 14;
+#[cfg(feature = "tdx")]
+const KVM_FEATURE_CLOCKSOURCE_BIT: u8 = 0;
+#[cfg(feature = "tdx")]
+const KVM_FEATURE_CLOCKSOURCE2_BIT: u8 = 3;
+#[cfg(feature = "tdx")]
+const KVM_FEATURE_CLOCKSOURCE_STABLE_BIT: u8 = 24;
+#[cfg(feature = "tdx")]
+const KVM_FEATURE_ASYNC_PF_BIT: u8 = 4;
+#[cfg(feature = "tdx")]
+const KVM_FEATURE_ASYNC_PF_VMEXIT_BIT: u8 = 10;
+#[cfg(feature = "tdx")]
+const KVM_FEATURE_STEAL_TIME_BIT: u8 = 5;
 
 #[derive(Debug, Copy, Clone)]
 /// Specifies the entry point address where the guest must start
@@ -156,6 +176,19 @@ pub enum Error {
 
     /// Missing SGX_LC CPU feature
     MissingSgxLaunchControlFeature,
+
+    /// Error populating CPUID with CPU identification
+    // xxx: todo
+    CpuidHypervisor(HypervisorError),
+
+    /// Error populating CPUID with KVM HyperV emulation details
+    CpuidKvmHyperV(vmm_sys_util::fam::Error),
+
+    /// Error populating CPUID with CPU identification
+    CpuidIdentification(vmm_sys_util::fam::Error),
+
+    /// Error checking CPUID compability
+    CpuidCheckCompability,
 }
 
 impl From<Error> for super::Error {
@@ -165,7 +198,7 @@ impl From<Error> for super::Error {
 }
 
 #[allow(dead_code, clippy::upper_case_acronyms)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum CpuidReg {
     EAX,
     EBX,
@@ -309,6 +342,306 @@ impl CpuidPatch {
     }
 }
 
+#[derive(Copy, Clone)]
+pub struct CpuidFeatureEntry {
+    pub function: u32,
+    pub index: u32,
+    pub feature_reg: CpuidReg,
+}
+
+impl CpuidFeatureEntry {
+    fn predefined_feature_entry_list() -> Vec<CpuidFeatureEntry> {
+        vec![
+            // Leaf 0x1, ECX/EDX, feature bits
+            CpuidFeatureEntry {
+                function: 1,
+                index: 0,
+                feature_reg: CpuidReg::ECX,
+            },
+            CpuidFeatureEntry {
+                function: 1,
+                index: 0,
+                feature_reg: CpuidReg::EDX,
+            },
+            // Leaf 0x7, EBX/ECX/EDX, extended features
+            CpuidFeatureEntry {
+                function: 7,
+                index: 0,
+                feature_reg: CpuidReg::EBX,
+            },
+            CpuidFeatureEntry {
+                function: 7,
+                index: 0,
+                feature_reg: CpuidReg::ECX,
+            },
+            CpuidFeatureEntry {
+                function: 7,
+                index: 0,
+                feature_reg: CpuidReg::EDX,
+            },
+            // Leaf 0x7 subleaf 0x1, EBX/ECX/EDX, extended features
+            CpuidFeatureEntry {
+                function: 7,
+                index: 1,
+                feature_reg: CpuidReg::EBX,
+            },
+            CpuidFeatureEntry {
+                function: 7,
+                index: 1,
+                feature_reg: CpuidReg::ECX,
+            },
+            CpuidFeatureEntry {
+                function: 7,
+                index: 1,
+                feature_reg: CpuidReg::EDX,
+            },
+            // Leaf 0x8000_0001, ECX/EDX, CPUID features bits
+            CpuidFeatureEntry {
+                function: 0x8000_0001,
+                index: 0,
+                feature_reg: CpuidReg::ECX,
+            },
+            CpuidFeatureEntry {
+                function: 0x8000_0001,
+                index: 0,
+                feature_reg: CpuidReg::EDX,
+            },
+        ]
+    }
+
+    fn get_features_from_cpuid(
+        cpuid: &CpuId,
+        feature_entry_list: &[CpuidFeatureEntry],
+    ) -> Vec<u32> {
+        let mut features = vec![0; feature_entry_list.len()];
+        for (i, feature_entry) in feature_entry_list.iter().enumerate() {
+            for cpuid_entry in cpuid.as_slice().iter() {
+                if cpuid_entry.function == feature_entry.function
+                    && cpuid_entry.index == feature_entry.index
+                {
+                    match feature_entry.feature_reg {
+                        CpuidReg::EAX => {
+                            features[i] = cpuid_entry.eax;
+                        }
+                        CpuidReg::EBX => {
+                            features[i] = cpuid_entry.ebx;
+                        }
+                        CpuidReg::ECX => {
+                            features[i] = cpuid_entry.ecx;
+                        }
+                        CpuidReg::EDX => {
+                            features[i] = cpuid_entry.edx;
+                        }
+                    }
+                }
+            }
+        }
+
+        features
+    }
+
+    // The function returns `Error` (a.k.a. "incompatible"), when the CPUID features from `src_vm_cpuid`
+    // is not a subset of those of the `dest_vm_cpuid`.
+    pub fn check_cpuid_compatibility(
+        src_vm_cpuid: &CpuId,
+        dest_vm_cpuid: &CpuId,
+    ) -> Result<(), Error> {
+        let feature_entry_list = &Self::predefined_feature_entry_list();
+        let src_vm_features =
+            CpuidFeatureEntry::get_features_from_cpuid(src_vm_cpuid, feature_entry_list);
+        let dest_vm_features =
+            CpuidFeatureEntry::get_features_from_cpuid(dest_vm_cpuid, feature_entry_list);
+
+        // Loop on feature bit and check if the 'source vm' feature is a subset of those of the 'destination vm' feature
+        let mut compatible = true;
+        for (i, feature_entry) in feature_entry_list.iter().enumerate() {
+            let src_vm_feature = src_vm_features[i];
+            let dest_vm_feature = dest_vm_features[i];
+            let different_feature_bits = src_vm_feature ^ dest_vm_feature;
+            let src_vm_feature_bits_only = different_feature_bits & src_vm_feature;
+            if src_vm_feature_bits_only != 0 {
+                warn!(
+                    "Detected incompatible CPUID entry: leaf={:#02x} (subleaf={:#02x}), register='{:?}', \
+                    source VM feature='{:#04x}', destination VM feature'{:#04x}'.",
+                    feature_entry.function, feature_entry.index, feature_entry.feature_reg,
+                    src_vm_feature, dest_vm_feature
+                    );
+
+                compatible = false;
+            }
+        }
+
+        if compatible {
+            info!("No incompatibility detected.");
+            Ok(())
+        } else {
+            Err(Error::CpuidCheckCompability)
+        }
+    }
+}
+
+pub fn generate_common_cpuid(
+    hypervisor: Arc<dyn hypervisor::Hypervisor>,
+    topology: Option<(u8, u8, u8)>,
+    sgx_epc_sections: Option<Vec<SgxEpcSection>>,
+    phys_bits: u8,
+    kvm_hyperv: bool,
+    #[cfg(feature = "tdx")] tdx_enabled: bool,
+) -> super::Result<CpuId> {
+    let cpuid_patches = vec![
+        // Patch tsc deadline timer bit
+        CpuidPatch {
+            function: 1,
+            index: 0,
+            flags_bit: None,
+            eax_bit: None,
+            ebx_bit: None,
+            ecx_bit: Some(TSC_DEADLINE_TIMER_ECX_BIT),
+            edx_bit: None,
+        },
+        // Patch hypervisor bit
+        CpuidPatch {
+            function: 1,
+            index: 0,
+            flags_bit: None,
+            eax_bit: None,
+            ebx_bit: None,
+            ecx_bit: Some(HYPERVISOR_ECX_BIT),
+            edx_bit: None,
+        },
+        // Enable MTRR feature
+        CpuidPatch {
+            function: 1,
+            index: 0,
+            flags_bit: None,
+            eax_bit: None,
+            ebx_bit: None,
+            ecx_bit: None,
+            edx_bit: Some(MTRR_EDX_BIT),
+        },
+    ];
+
+    // Supported CPUID
+    let mut cpuid = hypervisor.get_cpuid().map_err(Error::CpuidHypervisor)?;
+
+    CpuidPatch::patch_cpuid(&mut cpuid, cpuid_patches);
+
+    if let Some(t) = topology {
+        update_cpuid_topology(&mut cpuid, t.0, t.1, t.2);
+    }
+
+    if let Some(sgx_epc_sections) = sgx_epc_sections {
+        update_cpuid_sgx(&mut cpuid, sgx_epc_sections)?;
+    }
+
+    // Update some existing CPUID
+    for entry in cpuid.as_mut_slice().iter_mut() {
+        match entry.function {
+            // Set CPU physical bits
+            0x8000_0008 => {
+                entry.eax = (entry.eax & 0xffff_ff00) | (phys_bits as u32 & 0xff);
+            }
+            // Disable KVM_FEATURE_ASYNC_PF_INT
+            // This is required until we find out why the asynchronous page
+            // fault is generating unexpected behavior when using interrupt
+            // mechanism.
+            // TODO: Re-enable KVM_FEATURE_ASYNC_PF_INT (#2277)
+            0x4000_0001 => {
+                entry.eax &= !(1 << KVM_FEATURE_ASYNC_PF_INT_BIT);
+
+                // These features are not supported by TDX
+                #[cfg(feature = "tdx")]
+                if tdx_enabled {
+                    entry.eax &= !(1 << KVM_FEATURE_CLOCKSOURCE_BIT
+                        | 1 << KVM_FEATURE_CLOCKSOURCE2_BIT
+                        | 1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT
+                        | 1 << KVM_FEATURE_ASYNC_PF_BIT
+                        | 1 << KVM_FEATURE_ASYNC_PF_VMEXIT_BIT
+                        | 1 << KVM_FEATURE_STEAL_TIME_BIT)
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Copy CPU identification string
+    for i in 0x8000_0002..=0x8000_0004 {
+        cpuid.retain(|c| c.function != i);
+        let leaf = unsafe { std::arch::x86_64::__cpuid(i) };
+        cpuid
+            .push(CpuIdEntry {
+                function: i,
+                eax: leaf.eax,
+                ebx: leaf.ebx,
+                ecx: leaf.ecx,
+                edx: leaf.edx,
+                ..Default::default()
+            })
+            .map_err(Error::CpuidIdentification)?;
+    }
+
+    if kvm_hyperv {
+        // Remove conflicting entries
+        cpuid.retain(|c| c.function != 0x4000_0000);
+        cpuid.retain(|c| c.function != 0x4000_0001);
+        // See "Hypervisor Top Level Functional Specification" for details
+        // Compliance with "Hv#1" requires leaves up to 0x4000_000a
+        cpuid
+            .push(CpuIdEntry {
+                function: 0x40000000,
+                eax: 0x4000000a, // Maximum cpuid leaf
+                ebx: 0x756e694c, // "Linu"
+                ecx: 0x564b2078, // "x KV"
+                edx: 0x7648204d, // "M Hv"
+                ..Default::default()
+            })
+            .map_err(Error::CpuidKvmHyperV)?;
+        cpuid
+            .push(CpuIdEntry {
+                function: 0x40000001,
+                eax: 0x31237648, // "Hv#1"
+                ..Default::default()
+            })
+            .map_err(Error::CpuidKvmHyperV)?;
+        cpuid
+            .push(CpuIdEntry {
+                function: 0x40000002,
+                eax: 0x3839,  // "Build number"
+                ebx: 0xa0000, // "Version"
+                ..Default::default()
+            })
+            .map_err(Error::CpuidKvmHyperV)?;
+        cpuid
+            .push(CpuIdEntry {
+                function: 0x4000_0003,
+                eax: 1 << 1 // AccessPartitionReferenceCounter
+                   | 1 << 2 // AccessSynicRegs
+                   | 1 << 3 // AccessSyntheticTimerRegs
+                   | 1 << 9, // AccessPartitionReferenceTsc
+                edx: 1 << 3, // CPU dynamic partitioning
+                ..Default::default()
+            })
+            .map_err(Error::CpuidKvmHyperV)?;
+        cpuid
+            .push(CpuIdEntry {
+                function: 0x4000_0004,
+                eax: 1 << 5, // Recommend relaxed timing
+                ..Default::default()
+            })
+            .map_err(Error::CpuidKvmHyperV)?;
+        for i in 0x4000_0005..=0x4000_000a {
+            cpuid
+                .push(CpuIdEntry {
+                    function: i,
+                    ..Default::default()
+                })
+                .map_err(Error::CpuidKvmHyperV)?;
+        }
+    }
+
+    Ok(cpuid)
+}
+
 pub fn configure_vcpu(
     fd: &Arc<dyn hypervisor::Vcpu>,
     id: u8,
@@ -317,7 +650,7 @@ pub fn configure_vcpu(
     cpuid: CpuId,
     kvm_hyperv: bool,
 ) -> super::Result<()> {
-    // Per vCPU CPUID changes; common are handled via CpuManager::generate_common_cpuid()
+    // Per vCPU CPUID changes; common are handled via generate_common_cpuid()
     let mut cpuid = cpuid;
     CpuidPatch::set_cpuid_reg(&mut cpuid, 0xb, None, CpuidReg::EDX, u32::from(id));
     CpuidPatch::set_cpuid_reg(&mut cpuid, 0x1f, None, CpuidReg::EDX, u32::from(id));
@@ -614,7 +947,7 @@ pub fn get_host_cpu_phys_bits() -> u8 {
     }
 }
 
-pub fn update_cpuid_topology(
+fn update_cpuid_topology(
     cpuid: &mut CpuId,
     threads_per_core: u8,
     cores_per_die: u8,
@@ -679,7 +1012,7 @@ pub fn update_cpuid_topology(
 
 // The goal is to update the CPUID sub-leaves to reflect the number of EPC
 // sections exposed to the guest.
-pub fn update_cpuid_sgx(cpuid: &mut CpuId, epc_sections: Vec<SgxEpcSection>) -> Result<(), Error> {
+fn update_cpuid_sgx(cpuid: &mut CpuId, epc_sections: Vec<SgxEpcSection>) -> Result<(), Error> {
     // Something's wrong if there's no EPC section.
     if epc_sections.is_empty() {
         return Err(Error::NoSgxEpcSection);
